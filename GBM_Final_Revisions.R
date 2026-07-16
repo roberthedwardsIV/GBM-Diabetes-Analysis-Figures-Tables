@@ -23,6 +23,9 @@ library(mice)
 library(patchwork)
 library(tidyverse)
 library(forcats)
+library(flextable)
+library(officer)
+library(gdtools)
 
 
 # external
@@ -2327,3 +2330,212 @@ pdf("IPW-KM Surve.pdf", width = 8, height = 6)
 print(fig4_plot)
 dev.off()
 
+
+
+
+
+
+
+# Table 1 .docx -----
+library(flextable)
+library(officer)
+library(gtsummary)
+library(dplyr)
+
+heavy_border <- fp_border(color = "black", width = 1.5)
+light_border <- fp_border(color = "#D3D3D3", width = 0.5)
+
+table1 <-
+  tbl_summary(
+    all_patients %>% dplyr::mutate(diabetes = factor(diabetes, levels = c("Non-Diabetic", "Diabetic"), labels = c("Non-Diabetics", "Diabetics"))),
+    include = c(`Age (yrs.)`, `Age_At_Diagnosis`, `Sex`, `Baseline KPS`, `Baseline_KPS`, `Resection Status`, 
+                `MGMT Status`, `KI67`, `Ki67`, `Treatment Status`),
+    by = diabetes,
+    missing = "no",
+    type = all_continuous() ~ "continuous", 
+    statistic = all_continuous() ~ "{median} ({min}, {max})",
+    digits = list(
+      `Age_At_Diagnosis` ~ function(x) ifelse(x < 1, "<1", as.character(round(x, 0)))
+    ),
+    label = list(
+      `Age (yrs.)` ~ "Age (years)",
+      KI67 ~ "Ki-67 Index",
+      `Baseline KPS` ~ "Baseline KPS",
+      `MGMT Status` ~ "MGMT Status"
+    )
+  ) |> 
+  add_p(
+    test = list(all_categorical() ~ "chisq.test", all_continuous() ~ "wilcox.test")
+  ) %>%
+  modify_footnote(everything() ~ NA) %>%
+  modify_header(
+    label = "Variable",
+    all_stat_cols() ~ "{level}\nn = {n}¹", 
+    p.value = "p value"
+  ) |>
+  bold_labels() |>
+  modify_table_body(
+    ~ .x %>%
+      dplyr::mutate(
+        label = ifelse(grepl("80", label) & !grepl("61", label), ">80", label), 
+        label = ifelse(var_type == "continuous", "Median", label),
+        row_type = ifelse(var_type == "continuous", "level", row_type),
+        p_fmt = ifelse(is.na(p.value), NA_character_, 
+                       ifelse(p.value < 0.0001, "<0.0001", format(round(p.value, 4), nsmall = 4))),
+        p.value = dplyr::case_when(
+          !is.na(p.value) & var_type %in% c("categorical", "dichotomous") ~ paste0(p_fmt, "²"),
+          !is.na(p.value) & var_type == "continuous" ~ paste0(p_fmt, "³"),
+          TRUE ~ p_fmt
+        ),
+        label = ifelse(row_type == "level", paste0("\U00A0\U00A0\U00A0\U00A0", label), label)
+      ) %>%
+      dplyr::select(-p_fmt)
+  ) |>
+  modify_fmt_fun(p.value ~ function(x) x)
+
+table1 %>%
+  as_flex_table() %>%
+  border_remove() %>% 
+  
+  hline(part = "body", border = light_border) %>%
+  hline_top(part = "header", border = heavy_border) %>%
+  hline_bottom(part = "header", border = heavy_border) %>%
+  hline_bottom(part = "body", border = heavy_border) %>%
+  
+  flextable::valign(valign = "center", part = "all") %>%           
+  flextable::padding(padding = 0, part = "all") %>%                
+  flextable::line_spacing(space = 1, part = "all") %>%             
+  flextable::height_all(height = 0.1, part = "all") %>%            
+  flextable::hrule(rule = "atleast", part = "all") %>%             
+  
+  set_table_properties(layout = "fixed") %>%
+  width(j = 1, width = 2.5) %>%  
+  width(j = 2:4, width = 1.2) %>% 
+  
+  flextable::font(fontname = "Arial", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::fontsize(size = 9, part = "footer") %>%
+  flextable::align(j = 2:4, align = "center", part = "all") %>%
+  flextable::align(j = 1, align = "left", part = "all") %>%
+  flextable::bold(part = "header") %>%
+  
+  set_caption(caption = as_paragraph(as_b("Table 1: "), "Demographic data and univariate analysis on non-diabetic and diabetic patients."),
+              align_with_table = FALSE, 
+              fp_p = fp_par(text.align = "left") 
+  ) %>%
+  add_footer_lines(values = paste0(
+    "¹ n (%); Median (Min, Max)\n",
+    "² Pearson's Chi-squared test\n",
+    "³ Wilcoxon rank sum test\n\n",
+    "KPS = Karnofsky Performance Scale; STR = Subtotal Resection; GTR = Gross Total Resection; ",
+    "MGMT = O⁶-methylguanine-DNA methyltransferase; RT = Radiation Therapy; TMZ = Temozolomide"
+  )) %>%
+  
+  save_as_docx(path = "Table 1.docx")
+
+
+
+# Table 2 .docx ------
+format_p <- function(x) { ifelse(x < 0.0001, "<0.0001", sprintf("%.4f", x)) }
+
+shared_labels_s1 <- list(
+  Age_At_Diagnosis     ~ "Age at Diagnosis (Continuous)", 
+  Baseline_KPS         ~ "Baseline KPS (Continuous)",
+  `Resection Status`   ~ "Resection Status",
+  `MGMT Status`        ~ "MGMT Status",
+  `Treatment Status`   ~ "Treatment Status"
+)
+
+all_patients$`MGMT Status` <- relevel(factor(all_patients$`MGMT Status`), ref = "Unmethylated")
+
+all_patients$`Treatment Status` <- factor(
+  all_patients$`Treatment Status`, 
+  levels = c("None", "RT Only", "Chemotherapy Only", "TMZ/RT Only", "TMZ/RT & 1+ Line")
+)
+
+supp_t1_cox_nondiab <- coxph(
+  Surv(Survival_months, Status) ~ Age_At_Diagnosis + Baseline_KPS + 
+    `Resection Status` + `MGMT Status` + `Treatment Status`,
+  data = all_patients,
+  subset = (diabetes == "Non-Diabetic")
+)
+
+supp_t1_tbl_nondiab <- tbl_regression(
+  supp_t1_cox_nondiab, exponentiate = TRUE, pvalue_fun = format_p, label = shared_labels_s1
+)
+
+supp_t1_cox_diab <- coxph(
+  Surv(Survival_months, Status) ~ Age_At_Diagnosis + Baseline_KPS + 
+    `Resection Status` + `MGMT Status` + `Treatment Status`,
+  data = all_patients,
+  subset = (diabetes == "Diabetic")
+)
+
+supp_t1_tbl_diab <- tbl_regression(
+  supp_t1_cox_diab, exponentiate = TRUE, pvalue_fun = format_p, label = shared_labels_s1
+)
+
+std_border <- fp_border(color = "black", width = 1)
+
+heavy_border <- fp_border(color = "black", width = 1.5)
+light_border <- fp_border(color = "#D3D3D3", width = 0.5)
+
+tbl_merge(
+  tbls = list(supp_t1_tbl_nondiab, supp_t1_tbl_diab),
+  tab_spanner = c("**Non-Diabetics**", "**Diabetics**") 
+) %>%
+  modify_header(
+    label = "**Prognostic Factor**", 
+    p.value_1 = "**p value**", 
+    p.value_2 = "**p value**"
+  ) %>%
+  bold_labels() %>%
+  remove_abbreviation() %>%
+  modify_table_body(
+    ~ .x %>%
+      dplyr::mutate(
+        label = ifelse(row_type == "level", paste0("\U00A0\U00A0\U00A0\U00A0", label), label)
+      )
+  ) %>%
+  as_flex_table() %>%
+  
+  border_remove() %>%
+  
+  add_header_lines(values = as_paragraph(as_b("Table 2: "), "Multivariate survival analysis of prognostic factors on non-diabetic and diabetic patients.")) %>%
+  
+  hline(i = 1, part = "header", border = heavy_border) %>%          
+  hline(i = 2, j = 2:4, part = "header", border = light_border) %>% 
+  hline(i = 2, j = 5:7, part = "header", border = light_border) %>% 
+  hline(i = 3, part = "header", border = heavy_border) %>%          
+  
+  
+  border_inner_h(part = "body", border = light_border) %>%          
+  hline_bottom(part = "body", border = heavy_border) %>%            
+  
+  flextable::valign(valign = "center", part = "all") %>%
+  flextable::padding(padding = 0, part = "all") %>%
+  
+  flextable::padding(j = 4, padding.right = 25, part = "all") %>%
+  flextable::padding(j = 5, padding.left = 25, part = "all") %>%
+  
+  flextable::line_spacing(space = 1, part = "all") %>%
+  flextable::height_all(height = 0.1, part = "all") %>%
+  flextable::hrule(rule = "atleast", part = "all") %>%
+  
+  set_table_properties(layout = "fixed") %>%
+  width(j = 1, width = 2.5) %>%
+  width(j = c(2, 3, 6, 7), width = 0.8) %>%
+  width(j = c(4, 5), width = 1.15) %>%
+  
+  flextable::font(fontname = "Arial", part = "all") %>%
+  flextable::fontsize(size = 10, part = "all") %>%
+  flextable::fontsize(size = 9, part = "footer") %>%
+  flextable::align(j = 1, align = "left", part = "all") %>%
+  flextable::align(j = 2:7, align = "center", part = "all") %>%
+  
+  flextable::align(i = 1, align = "left", part = "header") %>%
+  
+  add_footer_lines(values = "Abbreviations: HR = Hazard Ratio; CI = Confidence Interval; KPS = Karnofsky Performance Status; MGMT = O⁶-methylguanine-DNA methyltransferase; STR = Subtotal Resection; GTR = Gross Total Resection; RT = Radiation Therapy; TMZ = Temozolomide.") %>%
+  flextable::align(align = "left", part = "footer") %>%
+  
+  save_as_docx(path = "Table 2.docx")
