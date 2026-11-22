@@ -41,6 +41,20 @@ library(broom)
 df <- read_excel("Diabetics.xlsx")
 df$diabetes <- 1
 
+# Use medication status to distinguish verified nonuse from unavailable doses.
+unknown_dex_dose <- which(df$Dexamethasone == 1 &
+  df$Cumulative_Dex_Dose == 0 & df$Average_Dex_Dose == 0)
+df <- df %>%
+  mutate(
+    across(c(Average_Daily_Ins_Dose, Cumulative_Ins_Dose), ~ case_when(
+      Post_Diagnosis_Insulin == 0 ~ 0,
+      Post_Diagnosis_Insulin == 1 & Ins_Dosing_Info_Avail == 1 ~ .x,
+      TRUE ~ NA_real_
+    )),
+    across(c(Cumulative_Dex_Dose, Average_Dex_Dose), ~ replace(.x, unknown_dex_dose, NA_real_)),
+    Baseline_KPS = as.numeric(na_if(as.character(Baseline_KPS), "N/A"))
+  )
+
 tmp_df <- read_excel("Non-diabetics.xlsx")
 tmp_df <- tmp_df %>% rename(diabetes = Diabetes, 
                             Baseline_KPS = `Baseline KPS`, 
@@ -48,12 +62,13 @@ tmp_df <- tmp_df %>% rename(diabetes = Diabetes,
                             MGMT_Status = `MGMT Status`)
 
 all_patients <- bind_rows(
-  df %>% mutate(Baseline_KPS = as.numeric(Baseline_KPS)),
+  df,
   tmp_df %>% mutate(Ki67 = as.numeric(Ki67))
 )
 
 all_patients <- all_patients %>%
   mutate(
+    Baseline_KPS = replace(Baseline_KPS, which(Baseline_KPS == 0 & Survival_months > 0), NA_real_),
     `Sex` = factor(`Sex`, levels=c(1,2), labels=c("Male","Female")),
     `Resection Status` = factor(`Resection_Status`, levels=c(0,1,2), labels=c("None", "STR","GTR")),
     `Treatment Status` = factor(`Treatment_Status`, levels=c(0,1,2,3,4), labels=c("None","RT Only", "Chemotherapy Only", "TMZ/RT Only", "TMZ/RT & 1+ Line")),
@@ -682,15 +697,14 @@ labels_3a <- paste0(
 p3a <- fig3_km_helper(fit_3a, all_patients, "Diabetes/Insulin Status", labels_3a, tag_label = "A", 
                       palette_colors = c("#E64B35FF", "#4DBBD5FF", "#00A087FF"))
 
-cox_m1 <- coxph(Surv(Survival_months, Status) ~ Diabetes_Insulin_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients)
-cox_m2 <- coxph(Surv(Survival_months, Status) ~ Diabetes_Insulin_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients)
+cox_m1 <- coxph(Surv(Survival_months, Status) ~ Diabetes_Insulin_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients, model = TRUE)
+cox_m2 <- coxph(Surv(Survival_months, Status) ~ Diabetes_Insulin_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients, model = TRUE)
 
 t1 <- tidy(cox_m1, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Diabetes_Insulin_Status"))
 t2 <- tidy(cox_m2, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Diabetes_Insulin_Status"))
 
-n_nd <- sum(all_patients$Diabetes_Insulin_Status == "Non-Diabetic", na.rm = TRUE)
-n_d_ni <- sum(all_patients$Diabetes_Insulin_Status == "Diabetic (Non-Insulin)", na.rm = TRUE)
-n_d_i <- sum(all_patients$Diabetes_Insulin_Status == "Diabetic (Insulin-User)", na.rm = TRUE)
+n_3_m1 <- as.integer(table(cox_m1$model$Diabetes_Insulin_Status))
+n_3_m2 <- as.integer(table(cox_m2$model$Diabetes_Insulin_Status))
 
 plot_df <- data.frame(
   y_order = c(9, 8, 7, 6, 5, 4, 3, 2, 1), 
@@ -707,12 +721,15 @@ plot_df <- data.frame(
     "&nbsp;&nbsp;&nbsp;&nbsp;Diabetic (Non-Insulin)", 
     "&nbsp;&nbsp;&nbsp;&nbsp;Diabetic (Insulin-User)"
   ),
-  N = c(NA, n_nd, n_d_ni, n_d_i, NA, NA, n_nd, n_d_ni, n_d_i),
+  N = c(NA, n_3_m1, NA, NA, n_3_m2),
   estimate = c(NA, 1, t1$estimate[1], t1$estimate[2], NA, NA, 1, t2$estimate[1], t2$estimate[2]),
   conf.low = c(NA, NA, t1$conf.low[1], t1$conf.low[2], NA, NA, NA, t2$conf.low[1], t2$conf.low[2]),
   conf.high = c(NA, NA, t1$conf.high[1], t1$conf.high[2], NA, NA, NA, t2$conf.high[1], t2$conf.high[2]),
   p.value = c(NA, NA, t1$p.value[1], t1$p.value[2], NA, NA, NA, t2$p.value[1], t2$p.value[2])
 )
+
+# Keep the confidence intervals inside the forest plot column and clear of the sample sizes.
+hr_position <- function(hr) 6.5 + 0.8 * log(hr)
 
 plot_df <- plot_df %>%
   mutate(
@@ -728,9 +745,9 @@ plot_df <- plot_df %>%
     ),
     N_text = ifelse(is.na(N), "", as.character(N)),
     font_face = ifelse(row_type == "header", "bold", "plain"),
-    plot_est = 6.5 + log(estimate) * 1.5,
-    plot_low = 6.5 + log(conf.low) * 1.5,
-    plot_high = 6.5 + log(conf.high) * 1.5
+    plot_est = hr_position(estimate),
+    plot_low = hr_position(conf.low),
+    plot_high = hr_position(conf.high)
   )
 
 shade_df <- plot_df %>%
@@ -739,8 +756,8 @@ shade_df <- plot_df %>%
   mutate(is_shaded = row_number() %% 2 == 0) %>%
   filter(is_shaded)
 
-ticks_val <- c(0.5, 1, 2, 3)
-ticks_pos <- 6.5 + log(ticks_val) * 1.5
+ticks_val <- c(0.2, 0.5, 1, 2, 5)
+ticks_pos <- hr_position(ticks_val)
 
 p3b_plot <- ggplot(plot_df, aes(y = y_order)) +
   geom_rect(data = shade_df, aes(ymin = y_order - 0.5, ymax = y_order + 0.5, xmin = -0.5, xmax = 13.5),
@@ -925,17 +942,14 @@ p4a$plot <- p4a$plot +
     color = "black"
   )
 
-cox_4_m1 <- coxph(Surv(Survival_months, Status) ~ Ins_NIDM_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients)
-cox_4_m2 <- coxph(Surv(Survival_months, Status) ~ Ins_NIDM_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients)
+cox_4_m1 <- coxph(Surv(Survival_months, Status) ~ Ins_NIDM_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients, model = TRUE)
+cox_4_m2 <- coxph(Surv(Survival_months, Status) ~ Ins_NIDM_Status + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients, model = TRUE)
 
 t4_1 <- tidy(cox_4_m1, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Ins_NIDM_Status"))
 t4_2 <- tidy(cox_4_m2, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Ins_NIDM_Status"))
 
-n_nd_4  <- sum(all_patients$Ins_NIDM_Status == "Non-Diabetic", na.rm = TRUE)
-n_neith  <- sum(all_patients$Ins_NIDM_Status == "Neither", na.rm = TRUE)
-n_nidm   <- sum(all_patients$Ins_NIDM_Status == "NIDM Only", na.rm = TRUE)
-n_ins    <- sum(all_patients$Ins_NIDM_Status == "Insulin Only", na.rm = TRUE)
-n_both   <- sum(all_patients$Ins_NIDM_Status == "Both", na.rm = TRUE)
+n_4_m1 <- as.integer(table(cox_4_m1$model$Ins_NIDM_Status))
+n_4_m2 <- as.integer(table(cox_4_m2$model$Ins_NIDM_Status))
 
 plot_df_4 <- data.frame(
   y_order = c(13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1), 
@@ -956,7 +970,7 @@ plot_df_4 <- data.frame(
     "&nbsp;&nbsp;&nbsp;&nbsp;Insulin Only",
     "&nbsp;&nbsp;&nbsp;&nbsp;Both"
   ),
-  N = c(NA, n_nd_4, n_neith, n_nidm, n_ins, n_both, NA, NA, n_nd_4, n_neith, n_nidm, n_ins, n_both),
+  N = c(NA, n_4_m1, NA, NA, n_4_m2),
   estimate = c(NA, 1, t4_1$estimate[1], t4_1$estimate[2], t4_1$estimate[3], t4_1$estimate[4], NA, NA, 1, t4_2$estimate[1], t4_2$estimate[2], t4_2$estimate[3], t4_2$estimate[4]),
   conf.low = c(NA, NA, t4_1$conf.low[1], t4_1$conf.low[2], t4_1$conf.low[3], t4_1$conf.low[4], NA, NA, NA, t4_2$conf.low[1], t4_2$conf.low[2], t4_2$conf.low[3], t4_2$conf.low[4]),
   conf.high = c(NA, NA, t4_1$conf.high[1], t4_1$conf.high[2], t4_1$conf.high[3], t4_1$conf.high[4], NA, NA, NA, t4_2$conf.high[1], t4_2$conf.high[2], t4_2$conf.high[3], t4_2$conf.high[4]),
@@ -977,9 +991,9 @@ plot_df_4 <- plot_df_4 %>%
     ),
     N_text = ifelse(is.na(N), "", as.character(N)),
     font_face = ifelse(row_type == "header", "bold", "plain"),
-    plot_est = 6.5 + log(estimate) * 1.5,
-    plot_low = 6.5 + log(conf.low) * 1.5,
-    plot_high = 6.5 + log(conf.high) * 1.5
+    plot_est = hr_position(estimate),
+    plot_low = hr_position(conf.low),
+    plot_high = hr_position(conf.high)
   )
 
 shade_df_4 <- plot_df_4 %>%
@@ -987,9 +1001,6 @@ shade_df_4 <- plot_df_4 %>%
   group_by(model_id) %>%
   mutate(is_shaded = row_number() %% 2 == 0) %>%
   filter(is_shaded)
-
-ticks_val <- c(0.5, 1, 2, 3)
-ticks_pos <- 6.5 + log(ticks_val) * 1.5
 
 p4b_plot <- ggplot(plot_df_4, aes(y = y_order)) +
   geom_rect(data = shade_df_4, aes(ymin = y_order - 0.5, ymax = y_order + 0.5, xmin = -0.5, xmax = 13.5),
@@ -1176,17 +1187,14 @@ p5a$plot <- p5a$plot +
     color = "black"
   )
 
-cox_5_m1 <- coxph(Surv(Survival_months, Status) ~ Insulin_Use + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients)
-cox_5_m2 <- coxph(Surv(Survival_months, Status) ~ Insulin_Use + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients)
+cox_5_m1 <- coxph(Surv(Survival_months, Status) ~ Insulin_Use + Age_At_Diagnosis + Baseline_KPS + `Resection Status`, data = all_patients, model = TRUE)
+cox_5_m2 <- coxph(Surv(Survival_months, Status) ~ Insulin_Use + Age_At_Diagnosis + Baseline_KPS + `Resection Status` + `Treatment Status` + `MGMT Status`, data = all_patients, model = TRUE)
 
 t5_1 <- tidy(cox_5_m1, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Insulin_Use"))
 t5_2 <- tidy(cox_5_m2, exponentiate = TRUE, conf.int = TRUE) %>% filter(str_detect(term, "Insulin_Use"))
 
-n_nd_5 <- sum(all_patients$Insulin_Use == "Non-Diabetic", na.rm = TRUE)
-n_00 <- sum(all_patients$Insulin_Use == "-/-", na.rm = TRUE)
-n_11 <- sum(all_patients$Insulin_Use == "+/+", na.rm = TRUE)
-n_01 <- sum(all_patients$Insulin_Use == "-/+", na.rm = TRUE)
-n_10 <- sum(all_patients$Insulin_Use == "+/-", na.rm = TRUE)
+n_5_m1 <- as.integer(table(cox_5_m1$model$Insulin_Use))
+n_5_m2 <- as.integer(table(cox_5_m2$model$Insulin_Use))
 
 plot_df_5 <- data.frame(
   y_order = c(13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1), 
@@ -1207,7 +1215,7 @@ plot_df_5 <- data.frame(
     "&nbsp;&nbsp;&nbsp;&nbsp;-/+",
     "&nbsp;&nbsp;&nbsp;&nbsp;+/-"
   ),
-  N = c(NA, n_nd_5, n_00, n_11, n_01, n_10, NA, NA, n_nd_5, n_00, n_11, n_01, n_10),
+  N = c(NA, n_5_m1, NA, NA, n_5_m2),
   estimate = c(NA, 1, t5_1$estimate[1], t5_1$estimate[2], t5_1$estimate[3], t5_1$estimate[4], NA, NA, 1, t5_2$estimate[1], t5_2$estimate[2], t5_2$estimate[3], t5_2$estimate[4]),
   conf.low = c(NA, NA, t5_1$conf.low[1], t5_1$conf.low[2], t5_1$conf.low[3], t5_1$conf.low[4], NA, NA, NA, t5_2$conf.low[1], t5_2$conf.low[2], t5_2$conf.low[3], t5_2$conf.low[4]),
   conf.high = c(NA, NA, t5_1$conf.high[1], t5_1$conf.high[2], t5_1$conf.high[3], t5_1$conf.high[4], NA, NA, NA, t5_2$conf.high[1], t5_2$conf.high[2], t5_2$conf.high[3], t5_2$conf.high[4]),
@@ -1228,9 +1236,9 @@ plot_df_5 <- plot_df_5 %>%
     ),
     N_text = ifelse(is.na(N), "", as.character(N)),
     font_face = ifelse(row_type == "header", "bold", "plain"),
-    plot_est = 6.5 + log(estimate) * 1.5,
-    plot_low = 6.5 + log(conf.low) * 1.5,
-    plot_high = 6.5 + log(conf.high) * 1.5
+    plot_est = hr_position(estimate),
+    plot_low = hr_position(conf.low),
+    plot_high = hr_position(conf.high)
   )
 
 shade_df_5 <- plot_df_5 %>%
@@ -1238,9 +1246,6 @@ shade_df_5 <- plot_df_5 %>%
   group_by(model_id) %>%
   mutate(is_shaded = row_number() %% 2 == 0) %>%
   filter(is_shaded)
-
-ticks_val <- c(0.5, 1, 2, 3)
-ticks_pos <- 6.5 + log(ticks_val) * 1.5
 
 p5b_plot <- ggplot(plot_df_5, aes(y = y_order)) +
   geom_rect(data = shade_df_5, aes(ymin = y_order - 0.5, ymax = y_order + 0.5, xmin = -0.5, xmax = 13.5),
@@ -1345,111 +1350,67 @@ ggsave(
 )
 
 # Figure 6: insulin-dose testing (including permutation test) ------------------------------------------------------------
-# Permutation Tests for Optimal Insulin Dose Cutoff (Average + Cumulative Doses)
-perm_data <- diabetic %>%
-  filter(Post_Diagnosis_Insulin == 1 & !is.na(Average_Daily_Ins_Dose)) %>%
-  dplyr::select(Survival_months, Status, Average_Daily_Ins_Dose)
+f6_data <- diabetic %>% filter(!is.na(Survival_months), !is.na(Status))
 
-get_max_logrank <- function(df) {
-  cutoffs <- quantile(df$Average_Daily_Ins_Dose, probs = seq(0.2, 0.8, by = 0.05), na.rm = TRUE)
-  max_stat <- 0
-  
-  for (c in cutoffs) {
-    df$group <- ifelse(df$Average_Daily_Ins_Dose > c, "High", "Low")
-    
-    fit <- survdiff(Surv(Survival_months, Status) ~ group, data = df)
-    stat <- fit$chisq
-    
-    if (!is.na(stat) && stat > max_stat) {
-      max_stat <- stat
-    }
+f6_daily <- f6_data %>%
+  filter(!is.na(Average_Daily_Ins_Dose)) %>%
+  mutate(Dose_Group = factor(Average_Daily_Ins_Dose > 10, levels = c(FALSE, TRUE),
+    labels = c("No or lower dose (<=10 units/day)", "Higher dose (>10 units/day)")))
+
+f6_cum <- f6_data %>%
+  filter(!is.na(Cumulative_Ins_Dose)) %>%
+  mutate(Dose_Group = factor(Cumulative_Ins_Dose > 50, levels = c(FALSE, TRUE),
+    labels = c("No or lower dose (<=50 units)", "Higher dose (>50 units)")))
+
+test_dose_cutoff_search <- function(data, dose) {
+  cutoffs <- unique(quantile(dose, probs = seq(0.2, 0.8, by = 0.05)))
+  cutoffs <- cutoffs[cutoffs < max(dose)]
+  if (length(cutoffs) == 0) {
+    stop("The insulin dose cutoff search requires at least two distinct dose values.")
   }
-  return(max_stat)
-}
 
-true_max_stat <- get_max_logrank(perm_data)
-
-set.seed(2026) 
-n_permutations <- 1000
-perm_stats <- numeric(n_permutations)
-
-for (i in 1:n_permutations) {
-  shuffled_df <- perm_data
-  shuffled_idx <- sample(nrow(shuffled_df))
-  shuffled_df$Survival_months <- shuffled_df$Survival_months[shuffled_idx]
-  shuffled_df$Status <- shuffled_df$Status[shuffled_idx]
-  
-  perm_stats[i] <- get_max_logrank(shuffled_df)
-}
-
-adjusted_p_value <- sum(perm_stats >= true_max_stat) / n_permutations
-
-cat("--------------------------------------------------\n")
-cat("Results for Average Insulin Dose (units/day)\n")
-cat("True Max Chi-Square Stat:   ", round(true_max_stat, 2), "\n")
-cat("Permutation-Adjusted P-value:", format(adjusted_p_value, nsmall=4), "\n")
-cat("--------------------------------------------------\n")
-
-perm_data_cum <- diabetic %>%
-  filter(Post_Diagnosis_Insulin == 1 & !is.na(Cumulative_Ins_Dose)) %>%
-  dplyr::select(Survival_months, Status, Cumulative_Ins_Dose)
-
-get_max_logrank_cum <- function(df) {
-  cutoffs <- quantile(df$Cumulative_Ins_Dose, probs = seq(0.2, 0.8, by = 0.05), na.rm = TRUE)
-  max_stat <- 0
-  
-  for (c in cutoffs) {
-    df$group <- ifelse(df$Cumulative_Ins_Dose > c, "High", "Low")
-    fit <- survdiff(Surv(Survival_months, Status) ~ group, data = df)
-    stat <- fit$chisq
-    if (!is.na(stat) && stat > max_stat) { max_stat <- stat }
+  # Keep follow-up time and event status paired when permuting outcomes.
+  outcomes <- data[, c("Survival_months", "Status")]
+  max_logrank <- function(outcomes) {
+    stats <- vapply(cutoffs, function(cutoff) {
+      outcomes$group <- dose > cutoff
+      survdiff(Surv(Survival_months, Status) ~ group, data = outcomes)$chisq
+    }, numeric(1))
+    max(c(0, stats), na.rm = TRUE)
   }
-  return(max_stat)
+
+  observed <- max_logrank(outcomes)
+  n_permutations <- 1000L
+  set.seed(2026)
+  permuted <- replicate(n_permutations, max_logrank(outcomes[sample.int(nrow(outcomes)), ]))
+  exceedances <- sum(permuted >= observed)
+  # Use a finite-simulation p-value, including when no permutation reaches the observed statistic.
+  p_value <- (exceedances + 1) / (n_permutations + 1)
+
+  list(n = nrow(data), max_stat = observed, exceedances = exceedances,
+       n_permutations = n_permutations, p_value = p_value)
 }
 
-true_max_stat_cum <- get_max_logrank_cum(perm_data_cum)
+daily_cutoff_test <- test_dose_cutoff_search(f6_daily, f6_daily$Average_Daily_Ins_Dose)
+cum_cutoff_test <- test_dose_cutoff_search(f6_cum, f6_cum$Cumulative_Ins_Dose)
 
-set.seed(2026) 
-n_permutations <- 1000
-perm_stats_cum <- numeric(n_permutations)
-
-for (i in 1:n_permutations) {
-  shuffled_df <- perm_data_cum
-  shuffled_idx <- sample(nrow(shuffled_df))
-  shuffled_df$Survival_months <- shuffled_df$Survival_months[shuffled_idx]
-  shuffled_df$Status <- shuffled_df$Status[shuffled_idx]
-  perm_stats_cum[i] <- get_max_logrank_cum(shuffled_df)
+format_cutoff_search <- function(result) {
+  sprintf("Cutoff-search permutation p = %.4f\n%d of %d at least as extreme",
+          result$p_value, result$exceedances, result$n_permutations)
 }
-
-adjusted_p_value_cum <- sum(perm_stats_cum >= true_max_stat_cum) / n_permutations
-
-cat("--------------------------------------------------\n")
-cat("Results for Cumulative Insulin Dose (units)\n")
-cat("True Max Chi-Square Stat:               ", round(true_max_stat_cum, 2), "\n")
-cat("Cumulative Permutation-Adjusted P-value:", format(adjusted_p_value_cum, nsmall=4), "\n")
-cat("--------------------------------------------------\n")
-
-f6_data <- diabetic %>%
-  filter(Post_Diagnosis_Insulin == 1) %>%
-  mutate(
-    Daily_Dose_Group = factor(ifelse(Average_Daily_Ins_Dose > 10, "High Dose (>10 units/day)", "Low Dose (<=10 units/day)"), 
-                              levels = c("Low Dose (<=10 units/day)", "High Dose (>10 units/day)")),
-    Cum_Dose_Group = factor(ifelse(Cumulative_Ins_Dose > 50, "High Dose (>50 units)", "Low Dose (<=50 units)"), 
-                            levels = c("Low Dose (<=50 units)", "High Dose (>50 units)"))
-  )
 
 hist_theme <- theme_bw() + theme(
   plot.title = element_text(face = "bold", hjust = 0.5),
   panel.grid.minor = element_blank()
 )
 
-p6a <- ggplot(f6_data %>% filter(!is.na(Average_Daily_Ins_Dose)), aes(x = Average_Daily_Ins_Dose)) +
+p6a <- ggplot(f6_daily, aes(x = Average_Daily_Ins_Dose)) +
   geom_histogram(binwidth = 5, fill = "#87CEEB", color = "black") +
   labs(tag = "A", x = "Average Daily Insulin (units/day)", y = "Count") +
   hist_theme +
   theme(plot.tag = element_text(face = "bold", size = 16))
 
-p6c <- ggplot(f6_data %>% filter(!is.na(Cumulative_Ins_Dose)), aes(x = Cumulative_Ins_Dose)) +
+p6c <- ggplot(f6_cum, aes(x = Cumulative_Ins_Dose)) +
   geom_histogram(bins = 40, fill = "#87CEEB", color = "black") +
   scale_x_continuous(
     trans = "log1p", 
@@ -1460,33 +1421,17 @@ p6c <- ggplot(f6_data %>% filter(!is.na(Cumulative_Ins_Dose)), aes(x = Cumulativ
   hist_theme +
   theme(plot.tag = element_text(face = "bold", size = 16))
 
-daily_pval_str <- paste0(
-  "Max Chi-Square: ", round(true_max_stat, 2), "\n",
-  "Iterations: ", n_permutations, "\n",
-  ifelse(adjusted_p_value < 0.0001, 
-         "Permutation p < 0.0001", 
-         paste0("Permutation p = ", format(round(adjusted_p_value, 4), nsmall=4)))
-)
-
-cum_pval_str <- paste0(
-  "Max Chi-Square: ", round(true_max_stat_cum, 2), "\n",
-  "Iterations: ", n_permutations, "\n",
-  ifelse(adjusted_p_value_cum < 0.0001, 
-         "Permutation p < 0.0001", 
-         paste0("Permutation p = ", format(round(adjusted_p_value_cum, 4), nsmall=4)))
-)
-
-fit_6b <- survfit(Surv(Survival_months, Status) ~ Daily_Dose_Group, data = f6_data %>% filter(!is.na(Daily_Dose_Group)))
+fit_6b <- survfit(Surv(Survival_months, Status) ~ Dose_Group, data = f6_daily)
 p6b <- ggsurvplot(
   fit_6b,
-  data = f6_data,
+  data = f6_daily,
   conf.int = TRUE,
-  pval = daily_pval_str, 
+  pval = format_cutoff_search(daily_cutoff_test),
   pval.coord = c(23, 0.60),
   pval.size =3.5,
   palette = c("#87CEEB", "#FF0000"), 
   legend.title = "",
-  legend.labs = c("Low Dose (<=10 units/day)", "High Dose (>10 units/day)"),
+  legend.labs = sprintf("%s (n = %d)", levels(f6_daily$Dose_Group), fit_6b$n),
   legend = c(0.6, 0.85),
   xlim = c(0, 50),
   xlab = "Time (months)",
@@ -1494,17 +1439,17 @@ p6b <- ggsurvplot(
 )
 p6b$plot <- p6b$plot + labs(tag = "B") + theme(plot.tag = element_text(face = "bold", size = 16))
 
-fit_6d <- survfit(Surv(Survival_months, Status) ~ Cum_Dose_Group, data = f6_data %>% filter(!is.na(Cum_Dose_Group)))
+fit_6d <- survfit(Surv(Survival_months, Status) ~ Dose_Group, data = f6_cum)
 p6d <- ggsurvplot(
   fit_6d,
-  data = f6_data,
+  data = f6_cum,
   conf.int = TRUE,
-  pval = cum_pval_str,   
+  pval = format_cutoff_search(cum_cutoff_test),
   pval.coord = c(23, 0.60),
   pval.size = 3.5,
   palette = c("#87CEEB", "#FF0000"),
   legend.title = "",
-  legend.labs = c("Low Dose (<=50 units)", "High Dose (>50 units)"),
+  legend.labs = sprintf("%s (n = %d)", levels(f6_cum$Dose_Group), fit_6d$n),
   legend = c(0.6, 0.85),
   xlim = c(0, 50),
   xlab = "Time (months)",
@@ -1514,13 +1459,11 @@ p6d$plot <- p6d$plot + labs(tag = "D") + theme(plot.tag = element_text(face = "b
 
 
 figure6_legend <- paste0(
-  "**Figure 6**: Low versus high insulin usage. Distribution of average daily insulin among ",
-  "diabetic patients **(A)**. Kaplan-Meier survival difference between low versus high daily ",
-  "insulin usage at the optimal cutoff of 10 units/day, and survival difference remained ",
-  "significant after permutation testing with 1,000 iterations **(B)**. Distribution of cumulative ",
-  "insulin among diabetic patients **(C)**. Kaplan-Meier survival difference between low ",
-  "versus high cumulative insulin usage at the optimal cutoff of 50 units, but survival ",
-  "difference was not significant after permutation testing with 1,000 iterations **(D)**."
+  "**Figure 6**: Exploratory comparisons of no or lower insulin dose versus higher dose. ",
+  "Distributions **(A, C)** and survival curves **(B, D)** include verified nonuse and documented doses. ",
+  "The curves use historical cutoffs of 10 units/day **(B)** and 50 units **(D)**. ",
+  "The permutation p-values test the maximum statistic across the cutoff search. ",
+  "Average daily dose uses the historical survival-day denominator."
 )
 
 layout_fig6 <- "
@@ -1643,21 +1586,25 @@ supp_fig2_df <- diabetic %>%
   filter(!is.na(Post_Diagnosis_Insulin)) %>%
   mutate(
     Insulin_Group = factor(Post_Diagnosis_Insulin, levels = c(0, 1), labels = c("No Insulin", "Insulin")),
-    Complication_Count = as.numeric(ifelse(is.na(Diabetes_Complications), 0, nchar(str_remove_all(Diabetes_Complications, ",."))))
+    Complication_Count = na_if(vapply(strsplit(Diabetes_Complications, ",", fixed = TRUE),
+      function(codes) sum(nzchar(trimws(codes), keepNA = TRUE)), integer(1)), 0L)
   )
 
-wilcox_comp <- wilcox.test(Complication_Count ~ Insulin_Group, data = supp_fig2_df)
-chisq_comp <- chisq.test(table(supp_fig3_df$Complication_Count, supp_fig2_df$Insulin_Group))
+complication_availability <- with(supp_fig2_df, table(
+  Insulin_Group, Complication_Data = factor(is.na(Complication_Count),
+    levels = c(FALSE, TRUE), labels = c("Observed", "Missing"))
+))
+print(complication_availability)
 
-wilcox_dex <- wilcox.test(Average_Dex_Dose ~ Insulin_Group, data = supp_fig3_df)
+supp_fig2_comp <- supp_fig2_df %>% filter(!is.na(Complication_Count))
+wilcox_comp <- wilcox.test(Complication_Count ~ Insulin_Group, data = supp_fig2_comp)
+chisq_comp <- chisq.test(with(supp_fig2_comp, table(Complication_Count, Insulin_Group)))
 
-supp_fig2_df <- supp_fig2_df %>%
-  mutate(Dex_HD_LD = case_when(
-    is.na(Average_Dex_Dose) ~ NA_character_,
-    Average_Dex_Dose <= 4 ~ "Low Dose (<= 4mg)",
-    Average_Dex_Dose > 4 ~ "High Dose (> 4mg)"
-  ))
-chisq_dex_hdld <- chisq.test(table(supp_fig2_df$Dex_HD_LD, supp_fig2_df$Insulin_Group))
+supp_fig2_dex <- supp_fig2_df %>%
+  filter(!is.na(Average_Dex_Dose)) %>%
+  mutate(Dex_HD_LD = if_else(Average_Dex_Dose <= 4, "Low Dose (<= 4mg)", "High Dose (> 4mg)"))
+wilcox_dex <- wilcox.test(Average_Dex_Dose ~ Insulin_Group, data = supp_fig2_dex)
+chisq_dex_hdld <- chisq.test(with(supp_fig2_dex, table(Dex_HD_LD, Insulin_Group)))
 
 supp_fig2_df_hba1c <- supp_fig2_df %>% filter(!is.na(Baseline_HA1c) & Baseline_HA1c > 0)
 wilcox_HbA1c <- wilcox.test(Baseline_HA1c ~ Insulin_Group, data = supp_fig2_df_hba1c)
@@ -1670,8 +1617,7 @@ supp2_theme <- theme_bw() + theme(
 )
 
 # Graph A: Complications
-df_A <- supp_fig2_df %>%
-  filter(!is.na(Complication_Count)) %>%
+df_A <- supp_fig2_comp %>%
   count(Insulin_Group, Complication_Count) %>%
   tidyr::complete(Insulin_Group, Complication_Count, fill = list(n = 0)) %>%
   group_by(Insulin_Group) %>%
@@ -1712,8 +1658,7 @@ supp2_B <- ggplot(df_B, aes(x = Bin_Mid, y = pct, fill = Insulin_Group)) +
 
 
 # Graph C: Steroid Dose (Previously B)
-df_C <- supp_fig2_df %>%
-  filter(!is.na(Average_Dex_Dose)) %>%
+df_C <- supp_fig2_dex %>%
   mutate(Bin_Start = floor(Average_Dex_Dose / 2.5) * 2.5,
          Bin_Mid = Bin_Start + 1.25) %>%
   count(Insulin_Group, Bin_Mid) %>%
@@ -1733,13 +1678,12 @@ supp2_C <- ggplot(df_C, aes(x = Bin_Mid, y = pct, fill = Insulin_Group)) +
   supp2_theme
 
 supp_figure2_legend <- paste0(
-  "**Supplementary Figure 2**: Severity of diabetic complications, serum marker and ",
-  "dexamethasone usage. There was no difference in the distribution of the number of ",
-  "diabetic complications between the non-diabetic and diabetic cohorts **(A)**. A higher ",
-  "hemoglobin A1c was seen in diabetic patients than non-diabetics **(B)**. Distribution of ",
-  "dexamethasone dosage in insulin-using patients was only marginally higher compared ",
-  "to non-insulin-using patients, and no difference was noted between high versus low ",
-  "dose dexamethasone use in the two groups **(C)**."
+  "**Supplementary Figure 2**: Recorded complications **(A)**, HbA1c **(B)**, and average ",
+  "dexamethasone dose **(C)** by insulin use within the diabetes cohort. ",
+  sprintf("Complication counts were missing for %d nonusers and %d insulin users. ",
+          complication_availability["No Insulin", "Missing"],
+          complication_availability["Insulin", "Missing"]),
+  "Each panel uses patients with a recorded value for that measure."
 )
 
 layout_sfig2 <- "
@@ -2235,7 +2179,7 @@ tbl_merge(
 
 # figure 5: inverse probability weighting for insulin-use exposure ---------------------------------------------------------------
 f4_data <- diabetic %>%
-  filter(!is.na(Post_Diagnosis_Insulin)) %>%
+  filter(!is.na(Post_Diagnosis_Insulin), !is.na(Baseline_KPS)) %>%
   dplyr::select(Survival_months, Status, Post_Diagnosis_Insulin, 
                 Age_At_Diagnosis, `Baseline KPS`, `Resection Status`, 
                 `Treatment Status`, `MGMT Status`, Sex, `Average_Dex_Dose`, NIDM) %>%
@@ -2263,9 +2207,8 @@ f4_data <- f4_data %>%
                             labels = c("Insulin-User", "No Insulin"))
   )
 
-# Max weight was >17 prior to outlier filtering -> 2.68 after
-lower_bound <- quantile(f3_data$IPW_stabilized, 0.01)
-upper_bound <- quantile(f3_data$IPW_stabilized, 0.99)
+lower_bound <- quantile(f4_data$IPW_stabilized, 0.01)
+upper_bound <- quantile(f4_data$IPW_stabilized, 0.99)
 
 
 f4_data <- f4_data %>%
@@ -2305,7 +2248,8 @@ fig4_plot <- ggsurvplot(
   pval.coord = c(48, 0.5),
   palette = "npg",
   legend.title = "IPW Adjusted Cohort",
-  legend.labs = c("Insulin-User", "No Insulin"),
+  legend.labs = sprintf("%s (n = %d)", levels(f4_data$Insulin_Factor),
+                        as.integer(table(f4_data$Insulin_Factor))),
   legend = c(0.99, 0.95),
   xlim = c(0, 80),
   xlab = "Time (months)",
@@ -2326,9 +2270,7 @@ fig4_plot$plot <- fig4_plot$plot +
   labs(title = "IPW-Adjusted Survival by Insulin-Use Exposure") +
   theme(plot.margin = margin(5, 5, 5, 5, unit="pt"))
 
-pdf("IPW-KM Surve.pdf", width = 8, height = 6)
-print(fig4_plot)
-dev.off()
+ggsave("IPW-KM Surve.pdf", plot = fig4_plot$plot, width = 8, height = 6)
 
 
 
